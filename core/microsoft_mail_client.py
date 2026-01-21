@@ -58,12 +58,14 @@ class MicrosoftMailClient:
         self._log("info", "fetching verification code")
         token = self._get_access_token()
         if not token:
+            self._log("error", "failed to get access token, cannot check mailbox")
             return None
 
         auth_string = f"user={self.email}\x01auth=Bearer {token}\x01\x01".encode()
         client = imaplib.IMAP4_SSL("outlook.office365.com", 993)
         try:
             client.authenticate("XOAUTH2", lambda _: auth_string)
+            self._log("info", "IMAP authentication successful, connected to mailbox")
         except Exception as exc:
             self._log("error", f"IMAP auth failed: {exc}")
             try:
@@ -73,23 +75,30 @@ class MicrosoftMailClient:
             return None
 
         search_since = since_time or (datetime.now() - timedelta(minutes=5))
+        self._log("info", f"searching for emails since {search_since.strftime('%Y-%m-%d %H:%M:%S')}")
 
         try:
             for mailbox in ("INBOX", "Junk"):
                 try:
                     status, _ = client.select(mailbox, readonly=True)
                     if status != "OK":
+                        self._log("warning", f"failed to select mailbox {mailbox}")
                         continue
-                except Exception:
+                    self._log("info", f"checking mailbox: {mailbox}")
+                except Exception as e:
+                    self._log("warning", f"error selecting mailbox {mailbox}: {e}")
                     continue
 
                 # 搜索所有邮件
                 status, data = client.search(None, "ALL")
                 if status != "OK" or not data or not data[0]:
+                    self._log("info", f"no emails found in {mailbox}")
                     continue
 
                 ids = data[0].split()[-5:]  # 只检查最近 5 封
+                self._log("info", f"found {len(ids)} emails in {mailbox}")
 
+                checked_count = 0
                 for msg_id in reversed(ids):
                     status, msg_data = client.fetch(msg_id, "(RFC822)")
                     if status != "OK" or not msg_data:
@@ -105,17 +114,23 @@ class MicrosoftMailClient:
                     msg = message_from_bytes(raw_bytes)
                     msg_date = self._parse_message_date(msg.get("Date"))
 
-                    # 按时间过滤
+                    # 按时间过滤（静默跳过旧邮件）
                     if msg_date and msg_date < search_since:
                         continue
 
+                    checked_count += 1
                     content = self._message_to_text(msg)
                     import re
                     match = re.search(r'[A-Z0-9]{6}', content)
                     if match:
                         code = match.group(0)
-                        self._log("info", f"code found in {mailbox}: {code}")
+                        self._log("info", f"✓ code found in {mailbox}: {code}")
                         return code
+
+                if checked_count > 0:
+                    self._log("info", f"checked {checked_count} recent emails in {mailbox}, no code found")
+
+            self._log("warning", "no verification code found in any mailbox")
         finally:
             try:
                 client.logout()

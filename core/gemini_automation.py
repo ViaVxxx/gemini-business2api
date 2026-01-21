@@ -187,7 +187,7 @@ class GeminiAutomation:
         # Step 3: 点击发送验证码按钮
         self._log("info", "clicking send verification code button")
         if not self._click_send_code_button(page):
-            self._log("error", "send code button not found")
+            self._log("error", "failed to trigger verification code sending")
             self._save_screenshot(page, "send_code_button_missing")
             return {"success": False, "error": "send code button not found"}
 
@@ -312,6 +312,8 @@ class GeminiAutomation:
         if direct_btn:
             try:
                 direct_btn.click()
+                self._log("info", "✓ send code button clicked")
+                time.sleep(3)  # 等待发送请求
                 return True
             except Exception:
                 pass
@@ -325,6 +327,8 @@ class GeminiAutomation:
                 if text and any(kw in text for kw in keywords):
                     try:
                         btn.click()
+                        self._log("info", "✓ send code button clicked")
+                        time.sleep(3)  # 等待发送请求
                         return True
                     except Exception:
                         pass
@@ -334,6 +338,7 @@ class GeminiAutomation:
         # 检查是否已经在验证码输入页面
         code_input = page.ele("css:input[jsname='ovqh0b']", timeout=2) or page.ele("css:input[name='pinInput']", timeout=1)
         if code_input:
+            self._log("info", "already on code input page")
             return True
 
         return False
