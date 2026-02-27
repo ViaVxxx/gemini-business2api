@@ -104,7 +104,20 @@ class RetryConfig(BaseModel):
     auto_refresh_accounts_seconds: int = Field(default=60, ge=0, le=600, description="自动刷新账号间隔（秒，0禁用）")
     # 定时刷新配置
     scheduled_refresh_enabled: bool = Field(default=False, description="是否启用定时刷新任务")
-    scheduled_refresh_interval_minutes: int = Field(default=30, ge=0, le=720, description="定时刷新检测间隔（分钟，0-12小时）")
+    scheduled_refresh_cron: str = Field(default="08:00,20:00", description="刷新时间，如 '08:00,20:00' 或 '*/120'(每120分钟)")
+    refresh_batch_size: int = Field(default=5, ge=1, le=20, description="每批刷新账号数")
+    refresh_batch_interval_minutes: int = Field(default=30, ge=5, le=120, description="批次间等待时间(分钟)")
+    refresh_cooldown_hours: float = Field(default=12.0, ge=1, le=48, description="同一账号刷新冷却期(小时)")
+    # 向后兼容：旧配置可能只有这个字段，读取时自动转换为 */N cron 格式
+    scheduled_refresh_interval_minutes: int = Field(default=0, ge=0, le=720, description="(旧字段，已废弃) 定时刷新检测间隔")
+
+class QuotaLimitsConfig(BaseModel):
+    """每日配额上限配置（基于 Google 官方限额，用于主动配额计数）"""
+    enabled: bool = Field(default=True, description="是否启用主动配额计数")
+    text_daily_limit: int = Field(default=120, ge=0, le=9999, description="对话每日上限（0=不限制）")
+    images_daily_limit: int = Field(default=2, ge=0, le=9999, description="绘图每日上限（0=不限制）")
+    videos_daily_limit: int = Field(default=1, ge=0, le=9999, description="视频每日上限（0=不限制）")
+
 
 class PublicDisplayConfig(BaseModel):
     """公开展示配置"""
@@ -133,6 +146,7 @@ class AppConfig(BaseModel):
     image_generation: ImageGenerationConfig
     video_generation: VideoGenerationConfig = Field(default_factory=VideoGenerationConfig)
     retry: RetryConfig
+    quota_limits: QuotaLimitsConfig = Field(default_factory=QuotaLimitsConfig)
     public_display: PublicDisplayConfig
     session: SessionConfig
 
@@ -247,6 +261,13 @@ class ConfigManager:
             print(f"[WARN] 重试配置加载失败，使用默认值: {e}")
             retry_config = RetryConfig()
 
+        # 加载配额上限配置
+        try:
+            quota_limits_config = QuotaLimitsConfig(**yaml_data.get("quota_limits", {}))
+        except Exception as e:
+            print(f"[WARN] 配额上限配置加载失败，使用默认值: {e}")
+            quota_limits_config = QuotaLimitsConfig()
+
         try:
             public_display_config = PublicDisplayConfig(
                 **yaml_data.get("public_display", {})
@@ -270,6 +291,7 @@ class ConfigManager:
             image_generation=image_generation_config,
             video_generation=video_generation_config,
             retry=retry_config,
+            quota_limits=quota_limits_config,
             public_display=public_display_config,
             session=session_config
         )
@@ -329,6 +351,8 @@ class ConfigManager:
 
             retry_config = RetryConfig(**data.get("retry", {}))
 
+            quota_limits_config = QuotaLimitsConfig(**data.get("quota_limits", {}))
+
             public_display_config = PublicDisplayConfig(
                 **data.get("public_display", {})
             )
@@ -344,6 +368,7 @@ class ConfigManager:
                 image_generation=image_generation_config,
                 video_generation=video_generation_config,
                 retry=retry_config,
+                quota_limits=quota_limits_config,
                 public_display=public_display_config,
                 session=session_config
             )
@@ -503,6 +528,10 @@ class _ConfigProxy:
     @property
     def retry(self):
         return config_manager.config.retry
+
+    @property
+    def quota_limits(self):
+        return config_manager.config.quota_limits
 
     @property
     def public_display(self):

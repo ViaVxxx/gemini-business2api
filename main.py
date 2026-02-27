@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 import httpx
 import aiofiles
-from fastapi import FastAPI, HTTPException, Header, Request, Body, Form
+from fastapi import FastAPI, HTTPException, Header, Request, Body, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -49,7 +49,7 @@ from core.google_api import (
     upload_context_file,
     get_session_file_metadata,
     download_image_with_jwt,
-    save_image_to_hf
+    save_image_to_hf,
 )
 from core.account import (
     AccountManager,
@@ -85,8 +85,8 @@ MODEL_TO_QUOTA_TYPE = {
 
 # ---------- 日志配置 ----------
 
-# 内存日志缓冲区 (保留最近 1000 条日志，重启后清空)
-log_buffer = deque(maxlen=1000)
+# 内存日志缓冲区 (保留最近 3000 条日志，重启后清空)
+log_buffer = deque(maxlen=3000)
 log_lock = Lock()
 
 # 统计数据持久化
@@ -652,7 +652,7 @@ async def serve_logo():
         return FileResponse(logo_path)
     raise HTTPException(404, "Not Found")
 
-@app.get("/admin/health")
+@app.get("/health")
 async def health_check():
     """健康检查端点，用于 Docker HEALTHCHECK"""
     return {"status": "ok"}
@@ -1198,10 +1198,13 @@ async def admin_get_accounts(request: Request):
             "cooldown_reason": cooldown_reason,
             "conversation_count": account_manager.conversation_count,
             "session_usage_count": account_manager.session_usage_count,
-            "quota_status": quota_status  # 新增配额状态
+            "quota_status": quota_status,
+            "trial_end": config.trial_end,
+            "trial_days_remaining": config.get_trial_days_remaining(),
         })
 
     return {"total": len(accounts_info), "accounts": accounts_info}
+
 
 @app.get("/admin/accounts-config")
 @require_login()
@@ -1484,7 +1487,17 @@ async def admin_get_settings(request: Request):
             "session_cache_ttl_seconds": config.retry.session_cache_ttl_seconds,
             "auto_refresh_accounts_seconds": config.retry.auto_refresh_accounts_seconds,
             "scheduled_refresh_enabled": config.retry.scheduled_refresh_enabled,
-            "scheduled_refresh_interval_minutes": config.retry.scheduled_refresh_interval_minutes
+            "scheduled_refresh_interval_minutes": config.retry.scheduled_refresh_interval_minutes,
+            "scheduled_refresh_cron": config.retry.scheduled_refresh_cron,
+            "refresh_batch_size": config.retry.refresh_batch_size,
+            "refresh_batch_interval_minutes": config.retry.refresh_batch_interval_minutes,
+            "refresh_cooldown_hours": config.retry.refresh_cooldown_hours,
+        },
+        "quota_limits": {
+            "enabled": config.quota_limits.enabled,
+            "text_daily_limit": config.quota_limits.text_daily_limit,
+            "images_daily_limit": config.quota_limits.images_daily_limit,
+            "videos_daily_limit": config.quota_limits.videos_daily_limit
         },
         "public_display": {
             "logo_url": config.public_display.logo_url,
@@ -1556,6 +1569,14 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         retry.setdefault("images_rate_limit_cooldown_seconds", config.retry.images_rate_limit_cooldown_seconds)
         retry.setdefault("videos_rate_limit_cooldown_seconds", config.retry.videos_rate_limit_cooldown_seconds)
         new_settings["retry"] = retry
+
+        # 配额上限配置
+        quota_limits = dict(new_settings.get("quota_limits") or {})
+        quota_limits.setdefault("enabled", config.quota_limits.enabled)
+        quota_limits.setdefault("text_daily_limit", config.quota_limits.text_daily_limit)
+        quota_limits.setdefault("images_daily_limit", config.quota_limits.images_daily_limit)
+        quota_limits.setdefault("videos_daily_limit", config.quota_limits.videos_daily_limit)
+        new_settings["quota_limits"] = quota_limits
 
         # 保存旧配置用于对比
         old_proxy_for_auth = PROXY_FOR_AUTH
@@ -2365,6 +2386,125 @@ async def generate_images(
         logger.error(f"[IMAGE-GEN] [req_{request_id}] 图片生成失败: {type(e).__name__}: {str(e)}")
         raise
 
+# ---------- 图片编辑 API (OpenAI 兼容 - 图生图) ----------
+@app.post("/v1/images/edits")
+async def edit_images(
+    request: Request,
+    image: UploadFile = File(..., description="要编辑的原始图片"),
+    prompt: str = Form(..., description="编辑描述"),
+    model: str = Form("gemini-imagen"),
+    n: int = Form(1),
+    size: str = Form("1024x1024"),
+    response_format: Optional[str] = Form(None),
+    mask: Optional[UploadFile] = File(None, description="遮罩图片（可选）"),
+    authorization: Optional[str] = Header(None),
+):
+    """OpenAI 兼容的图片编辑接口（图生图）
+
+    接收上传的图片和编辑描述，将其转换为多模态 ChatRequest，
+    调用 chat_impl 处理，然后将响应转换回 OpenAI 图片格式。
+    """
+    # API Key 验证
+    verify_api_key(API_KEY, authorization)
+
+    # 生成请求ID
+    request_id = str(uuid.uuid4())[:6]
+
+    try:
+        # 读取上传的图片
+        image_bytes = await image.read()
+        image_b64 = base64.b64encode(image_bytes).decode()
+        mime_type = image.content_type or "image/png"
+        data_uri = f"data:{mime_type};base64,{image_b64}"
+
+        logger.info(
+            f"[IMAGE-EDIT] [req_{request_id}] 收到图片编辑请求: "
+            f"model={model}, image_size={len(image_bytes)} bytes, "
+            f"mime={mime_type}, prompt={prompt[:100]}"
+        )
+
+        # 构造多模态消息内容（图片 + 文本）
+        content_parts = [
+            {"type": "image_url", "image_url": {"url": data_uri}},
+            {"type": "text", "text": prompt},
+        ]
+
+        # 如果有 mask，也加入消息
+        if mask:
+            mask_bytes = await mask.read()
+            mask_b64 = base64.b64encode(mask_bytes).decode()
+            mask_mime = mask.content_type or "image/png"
+            mask_uri = f"data:{mask_mime};base64,{mask_b64}"
+            content_parts.insert(1, {"type": "image_url", "image_url": {"url": mask_uri}})
+            logger.info(f"[IMAGE-EDIT] [req_{request_id}] 包含遮罩图片: {len(mask_bytes)} bytes")
+
+        # 构造 ChatRequest
+        chat_req = ChatRequest(
+            model=model,
+            messages=[
+                Message(role="user", content=content_parts)
+            ],
+            stream=False  # 图片编辑不支持流式
+        )
+
+        # 调用 chat_impl 获取响应
+        chat_response = await chat_impl(chat_req, request, authorization)
+
+        # 从响应中提取图片（复用 /v1/images/generations 的逻辑）
+        message_content = chat_response["choices"][0]["message"]["content"]
+
+        b64_pattern = r'!\[.*?\]\(data:([^;]+);base64,([^\)]+)\)'
+        b64_matches = re.findall(b64_pattern, message_content)
+        url_pattern = r'!\[.*?\]\((https?://[^\)]+)\)'
+        url_matches = re.findall(url_pattern, message_content)
+
+        # 确定响应格式：使用系统配置
+        system_format = config_manager.image_output_format
+        fmt = "b64_json" if system_format == "base64" else "url"
+
+        logger.info(f"[IMAGE-EDIT] [req_{request_id}] 使用系统配置: {system_format} -> {fmt}")
+
+        # 构建 OpenAI 格式的响应
+        created_time = int(time.time())
+        data_list = []
+
+        if fmt == "b64_json":
+            for mime, b64_data in b64_matches[:n]:
+                data_list.append({"b64_json": b64_data, "revised_prompt": prompt})
+            # 如果没有 base64 但有 URL，下载并转换
+            if not data_list and url_matches:
+                for url in url_matches[:n]:
+                    try:
+                        resp = await http_client.get(url)
+                        if resp.status_code == 200:
+                            b64_data = base64.b64encode(resp.content).decode()
+                            data_list.append({"b64_json": b64_data, "revised_prompt": prompt})
+                    except Exception as e:
+                        logger.error(f"[IMAGE-EDIT] [req_{request_id}] 下载图片失败: {url}, {str(e)}")
+        else:
+            for url in url_matches[:n]:
+                data_list.append({"url": url, "revised_prompt": prompt})
+            # 如果没有 URL 但有 base64，保存并生成 URL
+            if not data_list and b64_matches:
+                base_url = get_base_url(request)
+                chat_id = f"img-edit-{uuid.uuid4()}"
+                for idx, (mime, b64_data) in enumerate(b64_matches[:n], 1):
+                    try:
+                        img_data = base64.b64decode(b64_data)
+                        file_id = f"edit-{uuid.uuid4()}"
+                        url = save_image_to_hf(img_data, chat_id, file_id, mime, base_url, IMAGE_DIR)
+                        data_list.append({"url": url, "revised_prompt": prompt})
+                    except Exception as e:
+                        logger.error(f"[IMAGE-EDIT] [req_{request_id}] 保存图片失败: {str(e)}")
+
+        logger.info(f"[IMAGE-EDIT] [req_{request_id}] 图片编辑完成: {len(data_list)}张")
+
+        return {"created": created_time, "data": data_list}
+
+    except Exception as e:
+        logger.error(f"[IMAGE-EDIT] [req_{request_id}] 图片编辑失败: {type(e).__name__}: {str(e)}")
+        raise
+
 # ---------- 图片生成处理函数 ----------
 def parse_images_from_response(data_list: list) -> tuple[list, str]:
     """从API响应中解析图片文件引用
@@ -2415,6 +2555,7 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
     start_time = time.time()
     full_content = ""
     first_response_time = None
+    usage_counted = False
 
     # 记录发送给API的内容
     text_preview = text_content[:500] + "...(已截断)" if len(text_content) > 500 else text_content
@@ -2563,22 +2704,22 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                         logger.debug(f"[API] [{account_manager.config.account_id}] [req_{request_id}] Reply#{idx}无text，content_obj结构: {json.dumps(content_obj, ensure_ascii=False)[:300]}")
                         continue
 
+                    # 首次收到响应时记录时间和计数
+                    if first_response_time is None:
+                        first_response_time = time.time()
+                        if request is not None:
+                            request.state.first_response_time = first_response_time
+                    if not usage_counted:
+                        usage_counted = True
+                        account_manager.conversation_count += 1
+                        account_manager.increment_daily_usage(get_request_quota_type(model_name))
+
                     # 区分思考过程和正常内容
                     if content_obj.get("thought"):
                         # 思考过程使用 reasoning_content 字段（类似 OpenAI o1）
-                        if first_response_time is None:
-                            first_response_time = time.time()
-                            if request is not None:
-                                request.state.first_response_time = first_response_time
                         chunk = create_chunk(chat_id, created_time, model_name, {"reasoning_content": text}, None)
                         yield f"data: {chunk}\n\n"
                     else:
-                        if first_response_time is None:
-                            first_response_time = time.time()
-                            if request is not None:
-                                request.state.first_response_time = first_response_time
-                            # 第一次响应时统计成功次数
-                            account_manager.conversation_count += 1
                         # 正常内容使用 content 字段
                         full_content += text
                         chunk = create_chunk(chat_id, created_time, model_name, {"content": text}, None)
@@ -2598,6 +2739,11 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                 quota_type = get_request_quota_type(model_name)
                 if quota_type in ("images", "videos"):
                     logger.info(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 媒体生成请求，无文本内容属正常情况")
+                    # 媒体生成成功，计入每日配额（避免重复计数）
+                    if not usage_counted:
+                        usage_counted = True
+                        account_manager.conversation_count += 1
+                        account_manager.increment_daily_usage(quota_type)
                 else:
                     logger.warning(f"[API] [{account_manager.config.account_id}] [req_{request_id}] ⚠️ 空响应警告: 收到{response_count}个响应但无文本内容，可能是思考模型未生成最终回答或上游错误")
                     # 打印第一个响应对象的完整结构用于调试
